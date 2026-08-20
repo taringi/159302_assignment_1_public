@@ -1,0 +1,11 @@
+//////////////////////////////////////////////////////
+// sample command lines
+//////////////////////////////////////////////////////
+
+search.exe "single_run" astar_explist_manhattan "608435127" "123456780"
+search.exe single_run astar_explist_manhattan 608435127 123456780
+search.exe "animate_run" astar_explist_manhattan "608435127" "123456780"
+search.exe "batch_run" astar_explist_manhattan 
+search.exe "batch_run" astar_explist_misplacedtiles 
+search.exe "batch_run" uc_explist 
+search.exe "batch_run" all 

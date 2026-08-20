@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Office lock files
+~$*
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
