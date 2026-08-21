@@ -10,6 +10,8 @@
 ////////////////////////////////////////////////////////////////////////
 // You don't need to edit this file, or print it out.
 
+#ifdef _WIN32
+
 #include <windows.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -1966,3 +1968,729 @@ void graphdefaults()
 }
 
 void restorecrtmode() {}
+
+#else // !_WIN32 -- macOS / Linux backend built on SDL2 + SDL2_ttf
+////////////////////////////////////////////////////////////////////////
+//   SDL2-based re-implementation of the WinBGIm API above, so that the
+//   same graphics.h calls used by main.cpp work unchanged on macOS/Linux.
+//   Requires: brew install sdl2 sdl2_ttf (macOS) / libsdl2-dev libsdl2-ttf-dev (Linux)
+////////////////////////////////////////////////////////////////////////
+
+#include <SDL.h>
+#include <SDL_ttf.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <utility>
+#include <algorithm>
+#include "graphics.h"
+
+int bgiemu_handle_redraw = 1;
+int bgiemu_default_mode = VGAHI;
+
+namespace {
+
+struct RGB { unsigned char r, g, b; };
+
+RGB g_palette_rgb[64] = {
+    {0,0,0},       {0,0,255},     {0,255,0},     {0,255,255},
+    {255,0,0},     {255,0,255},   {165,42,42},   {211,211,211},
+    {47,79,79},    {173,216,230}, {32,178,170},  {224,255,255},
+    {240,128,128}, {219,112,147}, {255,255,0},   {255,255,255},
+    {0xF0,0xF8,0xFF}, {0xFA,0xEB,0xD7}, {0x22,0x85,0xFF}, {0x7F,0xFF,0xD4},
+    {0xF0,0xFF,0xFF}, {0xF5,0xF5,0xDC}, {0xFF,0xE4,0xC4}, {0xFF,0x7B,0xCD},
+    {0x00,0x00,0xFF}, {0x8A,0x2B,0xE2}, {0xA5,0x2A,0x2A}, {0xDE,0xB8,0x87},
+    {0x5F,0x9E,0xA0}, {0x7F,0xFF,0x00}, {0xD2,0x50,0x1E}, {0xFF,0x7F,0x50},
+    {0x64,0x95,0xED}, {0xFF,0xF8,0xDC}, {0xDC,0x14,0x3C}, {0x68,0xCF,0xDF},
+    {0x00,0x00,0x8B}, {0x00,0x8B,0x8B}, {0xB8,0x86,0x0B}, {0xA9,0xA9,0xA9},
+    {0x00,0x64,0x00}, {0xBD,0xB7,0x6B}, {0x8B,0x00,0x8B}, {0x55,0x6B,0x2F},
+    {0xFF,0x8C,0x00}, {0xB9,0x82,0xFC}, {0x8B,0x00,0x00}, {0xE9,0x96,0x7A},
+    {0x8F,0xBC,0x8F}, {0x48,0x3D,0x8B}, {0x2F,0x4F,0x4F}, {0x00,0xCE,0xD1},
+    {0x94,0x00,0xD3}, {0xFF,0x14,0x93}, {0x00,0xBF,0xFF}, {0x69,0x69,0x69},
+    {0x1E,0x90,0xFF}, {0xB2,0x22,0x22}, {0xFF,0xFA,0xF0}, {0x22,0x8B,0x22},
+    {0xFF,0x00,0xFF}, {0xDC,0xDC,0xDC}, {0xF8,0xF8,0xBF}, {0xFF,0xD7,0x00},
+};
+int g_palette_map[64];
+
+struct { int width; int height; } font_metrics[][11] = {
+{{0,0},{8,8},{16,16},{24,24},{32,32},{40,40},{48,48},{56,56},{64,64},{72,72},{80,80}},
+{{0,0},{13,18},{14,20},{16,23},{22,31},{29,41},{36,51},{44,62},{55,77},{66,93},{88,124}},
+{{0,0},{3,5},{4,6},{4,6},{6,9},{8,12},{10,15},{12,18},{15,22},{18,27},{24,36}},
+{{0,0},{11,19},{12,21},{14,24},{19,32},{25,42},{31,53},{38,64},{47,80},{57,96},{76,128}},
+{{0,0},{13,19},{14,21},{16,24},{22,32},{29,42},{36,53},{44,64},{55,80},{66,96},{88,128}},
+{{0,0},{11,19},{12,21},{14,24},{19,32},{25,42},{31,53},{38,64},{47,80},{57,96},{76,128}},
+{{0,0},{11,19},{12,21},{14,24},{19,32},{25,42},{31,53},{38,64},{47,80},{57,96},{76,128}},
+{{0,0},{13,18},{14,20},{16,23},{22,31},{29,41},{36,51},{44,62},{55,77},{66,93},{88,124}},
+{{0,0},{11,19},{12,21},{14,24},{19,32},{25,42},{31,53},{38,64},{47,80},{57,96},{76,128}},
+{{0,0},{11,19},{12,21},{14,24},{19,32},{25,42},{31,53},{38,64},{47,80},{57,96},{76,128}},
+{{0,0},{11,19},{12,21},{14,24},{19,32},{25,42},{31,53},{38,64},{47,80},{57,96},{76,128}}
+};
+int normal_font_size[] = {1,4,4,4,4,4,4,4,4,4,4};
+
+const char* kFontCandidates[] = {
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+};
+
+class char_queue {
+    std::vector<char> buf;
+    int put_pos = 0, get_pos = 0;
+  public:
+    void put(char ch) {
+        buf[put_pos] = ch;
+        if (++put_pos == (int)buf.size()) put_pos = 0;
+        if (put_pos == get_pos && !is_empty()) (void)get();
+    }
+    char get() {
+        char ch = buf[get_pos];
+        if (++get_pos == (int)buf.size()) get_pos = 0;
+        return ch;
+    }
+    bool is_empty() { return get_pos == put_pos; }
+    char_queue(int size = 256) : buf(size) {}
+};
+
+SDL_Window* g_window = nullptr;
+SDL_Renderer* g_renderer = nullptr;
+SDL_Texture* g_texture = nullptr;
+SDL_Surface* g_pages[16] = {nullptr};
+int g_window_width = 0, g_window_height = 0;
+int g_active_page = 0, g_visual_page = 0;
+
+int g_color = WHITE, g_bkcolor = BLACK;
+int g_cur_x = 0, g_cur_y = 0;
+int g_write_mode = COPY_PUT;
+int g_font_mul_x = 1, g_font_div_x = 1, g_font_mul_y = 1, g_font_div_y = 1;
+int g_gdi_error_code = grOk;
+
+linesettingstype g_line_settings = {SOLID_LINE, 0xFFFF, NORM_WIDTH};
+fillsettingstype g_fill_settings = {SOLID_FILL, WHITE};
+textsettingstype g_text_settings = {DEFAULT_FONT, HORIZ_DIR, 1, LEFT_TEXT, TOP_TEXT};
+viewporttype g_view_settings = {0, 0, 0, 0, CLIP_OFF};
+arccoordstype g_ac;
+palettetype g_current_palette;
+fillpatterntype g_user_fill_pattern = {-1,-1,-1,-1,-1,-1,-1,-1};
+
+char_queue g_kbd_queue;
+bool g_mouse_up = false, g_mouse_down = false;
+int g_mouse_cur_x = 0, g_mouse_cur_y = 0;
+int g_mouse_click_x = 0, g_mouse_click_y = 0;
+int g_which_mouse_button = LEFT_BUTTON;
+
+std::vector<std::pair<int, TTF_Font*>> g_font_cache;
+
+SDL_Surface* active_surface() {
+    return (g_active_page >= 0 && g_active_page < 16) ? g_pages[g_active_page] : nullptr;
+}
+
+void ensure_page(int page) {
+    if (page < 0 || page >= 16 || g_pages[page] || g_window_width <= 0) return;
+    g_pages[page] = SDL_CreateRGBSurfaceWithFormat(0, g_window_width, g_window_height, 32, SDL_PIXELFORMAT_RGBA32);
+    RGB rgb = g_palette_rgb[g_palette_map[g_bkcolor & 63] & 63];
+    SDL_FillRect(g_pages[page], nullptr, SDL_MapRGB(g_pages[page]->format, rgb.r, rgb.g, rgb.b));
+}
+
+Uint32 map_color(SDL_Surface* s, int c) {
+    RGB rgb = g_palette_rgb[g_palette_map[c & 63] & 63];
+    return SDL_MapRGB(s->format, rgb.r, rgb.g, rgb.b);
+}
+
+Uint32* pixel_ptr(SDL_Surface* s, int x, int y) {
+    return (Uint32*)((Uint8*)s->pixels + y * s->pitch) + x;
+}
+
+void raw_putpixel(SDL_Surface* s, int x, int y, Uint32 col) {
+    if (!s || x < 0 || y < 0 || x >= s->w || y >= s->h) return;
+    *pixel_ptr(s, x, y) = col;
+}
+
+Uint32 raw_getpixel(SDL_Surface* s, int x, int y) {
+    if (!s || x < 0 || y < 0 || x >= s->w || y >= s->h) return 0;
+    return *pixel_ptr(s, x, y);
+}
+
+void raw_line(SDL_Surface* s, int x0, int y0, int x1, int y1, Uint32 col) {
+    if (!s) return;
+    int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (true) {
+        raw_putpixel(s, x0, y0, col);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+void raw_hline(SDL_Surface* s, int x0, int x1, int y, Uint32 col) {
+    if (!s) return;
+    if (x0 > x1) std::swap(x0, x1);
+    SDL_Rect r{x0, y, x1 - x0 + 1, 1};
+    SDL_FillRect(s, &r, col);
+}
+
+void raw_rect_fill(SDL_Surface* s, int x0, int y0, int x1, int y1, Uint32 col) {
+    if (!s) return;
+    if (x0 > x1) std::swap(x0, x1);
+    if (y0 > y1) std::swap(y0, y1);
+    SDL_Rect r{x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+    SDL_FillRect(s, &r, col);
+}
+
+void raw_rect_outline(SDL_Surface* s, int x0, int y0, int x1, int y1, Uint32 col) {
+    raw_line(s, x0, y0, x1, y0, col);
+    raw_line(s, x1, y0, x1, y1, col);
+    raw_line(s, x1, y1, x0, y1, col);
+    raw_line(s, x0, y1, x0, y0, col);
+}
+
+void raw_circle(SDL_Surface* s, int cx, int cy, int r, Uint32 col) {
+    int x = r, y = 0, err = 0;
+    while (x >= y) {
+        raw_putpixel(s, cx + x, cy + y, col); raw_putpixel(s, cx + y, cy + x, col);
+        raw_putpixel(s, cx - y, cy + x, col); raw_putpixel(s, cx - x, cy + y, col);
+        raw_putpixel(s, cx - x, cy - y, col); raw_putpixel(s, cx - y, cy - x, col);
+        raw_putpixel(s, cx + y, cy - x, col); raw_putpixel(s, cx + x, cy - y, col);
+        y++;
+        if (err <= 0) err += 2 * y + 1;
+        if (err > 0) { x--; err -= 2 * x + 1; }
+    }
+}
+
+void raw_fill_ellipse(SDL_Surface* s, int cx, int cy, int rx, int ry, Uint32 col) {
+    if (!s || rx <= 0 || ry <= 0) return;
+    for (int y = -ry; y <= ry; y++) {
+        int dx = (int)(rx * std::sqrt(1.0 - (double)(y * y) / (double)(ry * ry)));
+        raw_hline(s, cx - dx, cx + dx, cy + y, col);
+    }
+}
+
+void raw_ellipse_arc(SDL_Surface* s, int cx, int cy, int rx, int ry, double a0, double a1, Uint32 col) {
+    if (!s) return;
+    if (a1 < a0) a1 += 360.0;
+    bool first = true;
+    int lastx = 0, lasty = 0;
+    for (double a = a0; a <= a1 + 0.001; a += 1.0) {
+        double rad = a * M_PI / 180.0;
+        int x = cx + (int)std::lround(rx * std::cos(rad));
+        int y = cy - (int)std::lround(ry * std::sin(rad));
+        if (!first) raw_line(s, lastx, lasty, x, y, col);
+        lastx = x; lasty = y; first = false;
+    }
+}
+
+void raw_fill_polygon(SDL_Surface* s, const std::vector<SDL_Point>& pts, Uint32 col) {
+    int n = (int)pts.size();
+    if (!s || n < 3) return;
+    int miny = pts[0].y, maxy = pts[0].y;
+    for (auto& p : pts) { miny = std::min(miny, p.y); maxy = std::max(maxy, p.y); }
+    for (int y = miny; y <= maxy; y++) {
+        std::vector<int> xs;
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            int y0 = pts[i].y, y1 = pts[j].y;
+            if (y0 == y1) continue;
+            if ((y >= y0 && y < y1) || (y >= y1 && y < y0)) {
+                double t = (double)(y - y0) / (double)(y1 - y0);
+                xs.push_back(pts[i].x + (int)std::lround(t * (pts[j].x - pts[i].x)));
+            }
+        }
+        std::sort(xs.begin(), xs.end());
+        for (size_t k = 0; k + 1 < xs.size(); k += 2) raw_hline(s, xs[k], xs[k + 1], y, col);
+    }
+}
+
+TTF_Font* get_font(int px_height) {
+    if (px_height < 6) px_height = 6;
+    for (auto& kv : g_font_cache) if (kv.first == px_height) return kv.second;
+    TTF_Font* f = nullptr;
+    for (const char* path : kFontCandidates) {
+        f = TTF_OpenFont(path, px_height);
+        if (f) break;
+    }
+    g_font_cache.push_back({px_height, f});
+    return f;
+}
+
+int font_pixel_height() {
+    int fnt = g_text_settings.font;
+    if (fnt < 0 || fnt > 10) fnt = 0;
+    if (g_text_settings.charsize == 0) {
+        int base = font_metrics[fnt][normal_font_size[fnt]].height;
+        return base * g_font_mul_y / (g_font_div_y ? g_font_div_y : 1);
+    }
+    int idx = g_text_settings.charsize;
+    if (idx > 10) idx = 10;
+    return font_metrics[fnt][idx].height;
+}
+
+SDL_Color to_sdl_color(int c) {
+    RGB rgb = g_palette_rgb[g_palette_map[c & 63] & 63];
+    return SDL_Color{rgb.r, rgb.g, rgb.b, 255};
+}
+
+void render_text(int x, int y, const char* str) {
+    if (!str || !*str || !active_surface()) return;
+    TTF_Font* f = get_font(font_pixel_height());
+    if (!f) return;
+    SDL_Surface* txt = TTF_RenderText_Shaded(f, str, to_sdl_color(g_color), to_sdl_color(g_bkcolor));
+    if (!txt) return;
+    int w = txt->w, h = txt->h;
+    int dx = x, dy = y;
+    if (g_text_settings.horiz == CENTER_TEXT) dx -= w / 2;
+    else if (g_text_settings.horiz == RIGHT_TEXT) dx -= w;
+    if (g_text_settings.vert == CENTER_TEXT) dy -= h / 2;
+    else if (g_text_settings.vert == BOTTOM_TEXT) dy -= h;
+    SDL_Rect dst{dx, dy, w, h};
+    SDL_BlitSurface(txt, nullptr, active_surface(), &dst);
+    SDL_FreeSurface(txt);
+}
+
+void present_page() {
+    if (!g_renderer || !g_pages[g_visual_page]) return;
+    if (g_texture) { SDL_DestroyTexture(g_texture); g_texture = nullptr; }
+    g_texture = SDL_CreateTextureFromSurface(g_renderer, g_pages[g_visual_page]);
+    SDL_RenderClear(g_renderer);
+    SDL_RenderCopy(g_renderer, g_texture, nullptr, nullptr);
+    SDL_RenderPresent(g_renderer);
+}
+
+void process_event(const SDL_Event& e) {
+    switch (e.type) {
+      case SDL_QUIT:
+        exit(0);
+      case SDL_TEXTINPUT:
+        if (e.text.text[0]) g_kbd_queue.put(e.text.text[0]);
+        break;
+      case SDL_KEYDOWN:
+        switch (e.key.keysym.sym) {
+          case SDLK_RETURN: case SDLK_KP_ENTER: g_kbd_queue.put(13); break;
+          case SDLK_BACKSPACE: g_kbd_queue.put(8); break;
+          case SDLK_ESCAPE: g_kbd_queue.put(27); break;
+          case SDLK_TAB: g_kbd_queue.put(9); break;
+          default: break;
+        }
+        break;
+      case SDL_MOUSEBUTTONDOWN:
+        g_mouse_click_x = e.button.x; g_mouse_click_y = e.button.y;
+        g_mouse_down = true;
+        g_which_mouse_button = (e.button.button == SDL_BUTTON_RIGHT) ? RIGHT_BUTTON : LEFT_BUTTON;
+        break;
+      case SDL_MOUSEBUTTONUP:
+        g_mouse_click_x = e.button.x; g_mouse_click_y = e.button.y;
+        g_mouse_up = true;
+        g_which_mouse_button = (e.button.button == SDL_BUTTON_RIGHT) ? RIGHT_BUTTON : LEFT_BUTTON;
+        break;
+      case SDL_MOUSEMOTION:
+        g_mouse_cur_x = e.motion.x; g_mouse_cur_y = e.motion.y;
+        break;
+      case SDL_WINDOWEVENT:
+        if (e.window.event == SDL_WINDOWEVENT_EXPOSED) present_page();
+        break;
+      default: break;
+    }
+}
+
+bool pump_events(bool wait) {
+    SDL_Event e;
+    if (wait) {
+        if (SDL_WaitEvent(&e)) { process_event(e); return true; }
+        return false;
+    }
+    bool any = false;
+    while (SDL_PollEvent(&e)) { process_event(e); any = true; }
+    return any;
+}
+
+} // namespace
+
+void _graphfreemem(void* ptr, unsigned int) { free(ptr); }
+void* _graphgetmem(unsigned int size) { return malloc(size); }
+
+int graphresult() { return g_gdi_error_code; }
+
+char* grapherrormsg(int code) {
+    static char buf[256];
+    snprintf(buf, sizeof buf, "graphics error %d", code);
+    return buf;
+}
+
+void setcolor(int c) { g_color = c & MAXCOLORS; }
+int getcolor() { return g_color; }
+int getmaxcolor() { return WHITE; }
+int getmaxmode() { return VGAMAX; }
+
+char* getmodename(int mode) {
+    static char buf[32];
+    snprintf(buf, sizeof buf, "%d x %d %s", g_window_width, g_window_height, mode < 2 ? "EGA" : "VGA");
+    return buf;
+}
+
+const char* getdrivername() { return "SDL2"; }
+
+int getx() { return g_cur_x; }
+int gety() { return g_cur_y; }
+int getmaxx() { return g_window_width - 1; }
+int getmaxy() { return g_window_height - 1; }
+
+void setlinestyle(int style, unsigned int pattern, int thickness) {
+    g_line_settings.linestyle = style;
+    g_line_settings.thickness = thickness;
+    g_line_settings.upattern = pattern;
+}
+void getlinesettings(linesettingstype* ls) { *ls = g_line_settings; }
+void setwritemode(int mode) { g_write_mode = mode; }
+
+void setpalette(int index, int color) {
+    if (index < 0 || index >= 64) return;
+    g_palette_map[index] = color & 63;
+    g_current_palette.colors[index] = color & 63;
+    if (index == 0) g_bkcolor = 0;
+}
+void setrgbpalette(int index, int red, int green, int blue) {
+    if (index < 0 || index >= 64) return;
+    g_palette_rgb[index] = RGB{(unsigned char)(red & 0xFC), (unsigned char)(green & 0xFC), (unsigned char)(blue & 0xFC)};
+    if (index == 0) g_bkcolor = 0;
+}
+void setallpalette(palettetype* pal) {
+    for (int i = 0; i < pal->size && i < 64; i++) g_palette_map[i] = pal->colors[i] & MAXCOLORS;
+    g_bkcolor = 0;
+}
+palettetype* getdefaultpalette() {
+    static palettetype default_palette = { 64,
+      { BLACK, BLUE, GREEN, CYAN, RED, MAGENT, BROWN, LIGHTGRAY, DARKGRAY,
+        LIGHTBLUE, LIGHTGREEN, LIGHTCYAN, LIGHTRED, LIGHTMAGENTA, YELLOW, WHITE,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+        50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+      }};
+    return &default_palette;
+}
+void getpalette(palettetype* pal) { *pal = g_current_palette; }
+int getpalettesize() { return MAXCOLORS + 1; }
+
+void setbkcolor(int color) { g_bkcolor = color & MAXCOLORS; }
+int getbkcolor() { return g_bkcolor; }
+
+void setfillstyle(int style, int color) {
+    g_fill_settings.pattern = style;
+    g_fill_settings.color = color & MAXCOLORS;
+}
+void getfillsettings(fillsettingstype* fs) { *fs = g_fill_settings; }
+void setfillpattern(char const* upattern, int color) {
+    for (int i = 0; i < 8; i++) g_user_fill_pattern[i] = upattern[i];
+    g_fill_settings.color = color & MAXCOLORS;
+    g_fill_settings.pattern = USER_FILL;
+}
+void getfillpattern(char const* fp) { memcpy((void*)fp, g_user_fill_pattern, sizeof g_user_fill_pattern); }
+
+void setusercharsize(int multx, int divx, int multy, int divy) {
+    g_font_mul_x = multx; g_font_div_x = divx;
+    g_font_mul_y = multy; g_font_div_y = divy;
+    g_text_settings.charsize = 0;
+}
+
+void moveto(int x, int y) { g_cur_x = x; g_cur_y = y; }
+void moverel(int dx, int dy) { moveto(g_cur_x + dx, g_cur_y + dy); }
+
+void settextstyle(int font, int direction, int char_size) {
+    if (char_size > 10) char_size = 10;
+    g_text_settings.direction = direction;
+    g_text_settings.font = font;
+    g_text_settings.charsize = char_size;
+}
+void settextjustify(int horiz, int vert) { g_text_settings.horiz = horiz; g_text_settings.vert = vert; }
+void gettextsettings(textsettingstype* ts) { *ts = g_text_settings; }
+
+int textheight(char const* str) {
+    TTF_Font* f = get_font(font_pixel_height());
+    if (!f) return 0;
+    int w, h;
+    TTF_SizeText(f, str, &w, &h);
+    return h;
+}
+int textwidth(char const* str) {
+    TTF_Font* f = get_font(font_pixel_height());
+    if (!f) return 0;
+    int w, h;
+    TTF_SizeText(f, str, &w, &h);
+    return w;
+}
+
+void outtext(char const* str) { render_text(g_cur_x, g_cur_y, str); }
+void outtextxy(int x, int y, char const* str) { render_text(x, y, str); }
+
+void setviewport(int x1, int y1, int x2, int y2, int clip) {
+    g_view_settings.left = x1; g_view_settings.top = y1;
+    g_view_settings.right = x2; g_view_settings.bottom = y2;
+    g_view_settings.clip = clip;
+    moveto(0, 0);
+}
+void getviewsettings(viewporttype* viewport) { *viewport = g_view_settings; }
+
+void ellipse(int x, int y, int start_angle, int end_angle, int rx, int ry) {
+    raw_ellipse_arc(active_surface(), x, y, rx, ry, start_angle, end_angle, map_color(active_surface(), g_color));
+}
+void fillellipse(int x, int y, int rx, int ry) {
+    if (g_fill_settings.pattern == EMPTY_FILL) return;
+    raw_fill_ellipse(active_surface(), x, y, rx, ry, map_color(active_surface(), g_fill_settings.color));
+}
+void setactivepage(int page) { ensure_page(page); g_active_page = page; }
+void setvisualpage(int page) { ensure_page(page); g_visual_page = page; present_page(); }
+void setaspectratio(int, int) {}
+void getaspectratio(int* ax, int* ay) { *ax = *ay = 10000; }
+
+void circle(int x, int y, int radius) {
+    raw_circle(active_surface(), x, y, radius, map_color(active_surface(), g_color));
+}
+void arc(int x, int y, int start_angle, int end_angle, int radius) {
+    g_ac.x = x; g_ac.y = y;
+    g_ac.xstart = x + (int)(radius * cos(start_angle * M_PI / 180.0));
+    g_ac.ystart = y - (int)(radius * sin(start_angle * M_PI / 180.0));
+    g_ac.xend = x + (int)(radius * cos(end_angle * M_PI / 180.0));
+    g_ac.yend = y - (int)(radius * sin(end_angle * M_PI / 180.0));
+    raw_ellipse_arc(active_surface(), x, y, radius, radius, start_angle, end_angle, map_color(active_surface(), g_color));
+}
+void getarccoords(arccoordstype* arccoords) { *arccoords = g_ac; }
+
+void pieslice(int x, int y, int start_angle, int end_angle, int radius) {
+    if (g_fill_settings.pattern == EMPTY_FILL) return;
+    SDL_Surface* s = active_surface();
+    if (!s) return;
+    std::vector<SDL_Point> pts;
+    pts.push_back(SDL_Point{x, y});
+    double a1 = end_angle < start_angle ? end_angle + 360.0 : end_angle;
+    for (double a = start_angle; a <= a1 + 0.001; a += 1.0) {
+        double rad = a * M_PI / 180.0;
+        pts.push_back(SDL_Point{x + (int)std::lround(radius * cos(rad)), y - (int)std::lround(radius * sin(rad))});
+    }
+    raw_fill_polygon(s, pts, map_color(s, g_fill_settings.color));
+}
+void sector(int x, int y, int start_angle, int end_angle, int rx, int ry) {
+    if (g_fill_settings.pattern == EMPTY_FILL) return;
+    SDL_Surface* s = active_surface();
+    if (!s) return;
+    std::vector<SDL_Point> pts;
+    pts.push_back(SDL_Point{x, y});
+    double a1 = end_angle < start_angle ? end_angle + 360.0 : end_angle;
+    for (double a = start_angle; a <= a1 + 0.001; a += 1.0) {
+        double rad = a * M_PI / 180.0;
+        pts.push_back(SDL_Point{x + (int)std::lround(rx * cos(rad)), y - (int)std::lround(ry * sin(rad))});
+    }
+    raw_fill_polygon(s, pts, map_color(s, g_fill_settings.color));
+}
+
+void bar(int left, int top, int right, int bottom) {
+    if (g_fill_settings.pattern == EMPTY_FILL) return;
+    raw_rect_fill(active_surface(), left, top, right, bottom, map_color(active_surface(), g_fill_settings.color));
+}
+void bar3d(int left, int top, int right, int bottom, int depth, int topflag) {
+    bar(left, top, right, bottom);
+    SDL_Surface* s = active_surface();
+    Uint32 col = map_color(s, g_color);
+    raw_rect_outline(s, left, top, right, bottom, col);
+    if (depth) {
+        raw_line(s, right, top, right + depth, top - depth / 2, col);
+        raw_line(s, right, bottom, right + depth, bottom - depth / 2, col);
+        if (topflag) raw_line(s, left, top, left + depth, top - depth / 2, col);
+    }
+}
+
+void lineto(int x, int y) {
+    raw_line(active_surface(), g_cur_x, g_cur_y, x, y, map_color(active_surface(), g_color));
+    moveto(x, y);
+}
+void linerel(int dx, int dy) { lineto(g_cur_x + dx, g_cur_y + dy); }
+void line(int x0, int y0, int x1, int y1) {
+    raw_line(active_surface(), x0, y0, x1, y1, map_color(active_surface(), g_color));
+}
+void rectangle(int left, int top, int right, int bottom) {
+    raw_rect_outline(active_surface(), left, top, right, bottom, map_color(active_surface(), g_color));
+}
+void drawpoly(int n_points, int* points) {
+    SDL_Surface* s = active_surface();
+    Uint32 col = map_color(s, g_color);
+    for (int i = 0; i + 1 < n_points; i++)
+        raw_line(s, points[2*i], points[2*i+1], points[2*i+2], points[2*i+3], col);
+}
+void fillpoly(int n_points, int* points) {
+    if (g_fill_settings.pattern == EMPTY_FILL) return;
+    std::vector<SDL_Point> pts(n_points);
+    for (int i = 0; i < n_points; i++) pts[i] = SDL_Point{points[2*i], points[2*i+1]};
+    raw_fill_polygon(active_surface(), pts, map_color(active_surface(), g_fill_settings.color));
+}
+
+void floodfill(int x, int y, int border) {
+    SDL_Surface* s = active_surface();
+    if (!s) return;
+    Uint32 borderPix = map_color(s, border);
+    Uint32 fillPix = map_color(s, g_fill_settings.color);
+    Uint32 startPix = raw_getpixel(s, x, y);
+    if (startPix == borderPix || startPix == fillPix) return;
+    std::vector<std::pair<int,int>> stack;
+    stack.push_back({x, y});
+    while (!stack.empty()) {
+        int cx = stack.back().first, cy = stack.back().second;
+        stack.pop_back();
+        if (cx < 0 || cy < 0 || cx >= s->w || cy >= s->h) continue;
+        Uint32 p = raw_getpixel(s, cx, cy);
+        if (p == borderPix || p == fillPix) continue;
+        raw_putpixel(s, cx, cy, fillPix);
+        stack.push_back({cx+1,cy}); stack.push_back({cx-1,cy});
+        stack.push_back({cx,cy+1}); stack.push_back({cx,cy-1});
+    }
+}
+
+bool mouseup() {
+    while (pump_events(false));
+    if (g_mouse_up) { g_mouse_up = false; return true; }
+    return false;
+}
+bool mousedown() {
+    while (pump_events(false));
+    if (g_mouse_down) { g_mouse_down = false; return true; }
+    return false;
+}
+void clearmouse() {
+    g_mouse_click_x = g_mouse_click_y = g_mouse_cur_x = g_mouse_cur_y = 0;
+    g_mouse_down = g_mouse_up = false;
+}
+int mouseclickx() { return g_mouse_click_x; }
+int mouseclicky() { return g_mouse_click_y; }
+int mousecurrentx() { return g_mouse_cur_x; }
+int mousecurrenty() { return g_mouse_cur_y; }
+int whichmousebutton() { return g_which_mouse_button; }
+
+int kbhit() {
+    while (pump_events(false));
+    return !g_kbd_queue.is_empty();
+}
+int getch() {
+    while (g_kbd_queue.is_empty()) pump_events(true);
+    return (unsigned char)g_kbd_queue.get();
+}
+
+void delay(unsigned msec) {
+    Uint32 start = SDL_GetTicks();
+    while (SDL_GetTicks() - start < msec) {
+        pump_events(false);
+        SDL_Delay(1);
+    }
+}
+
+void cleardevice() {
+    raw_rect_fill(active_surface(), 0, 0, g_window_width - 1, g_window_height - 1, map_color(active_surface(), g_bkcolor));
+    moveto(0, 0);
+}
+void clearviewport() {
+    raw_rect_fill(active_surface(), g_view_settings.left, g_view_settings.top,
+                  g_view_settings.right, g_view_settings.bottom, map_color(active_surface(), g_bkcolor));
+    moveto(0, 0);
+}
+
+void detectgraph(int* graphdriver, int* graphmode) { *graphdriver = VGA; *graphmode = bgiemu_default_mode; }
+int getgraphmode() { return bgiemu_default_mode; }
+void setgraphmode(int) {}
+void restorecrtmode() {}
+void graphdefaults() {
+    g_color = WHITE; g_bkcolor = BLACK;
+    g_line_settings = {SOLID_LINE, 0xFFFF, NORM_WIDTH};
+    g_fill_settings = {SOLID_FILL, WHITE};
+    g_text_settings = {DEFAULT_FONT, HORIZ_DIR, 1, LEFT_TEXT, TOP_TEXT};
+    moveto(0, 0);
+}
+unsigned int setgraphbufsize(unsigned int size) { return size; }
+void getmoderange(int, int* lo, int* hi) { *lo = *hi = 0; }
+int installuserdriver(char const*, int*) { return -1; }
+int installuserfont(char const*) { return -1; }
+int registerbgidriver(void*) { return -1; }
+int registerbgifont(void*) { return -1; }
+
+unsigned int imagesize(int x1, int y1, int x2, int y2) {
+    return (unsigned int)(sizeof(short) * 2 + (x2 - x1 + 1) * (y2 - y1 + 1) * sizeof(Uint32));
+}
+void getimage(int x1, int y1, int x2, int y2, void* image) {
+    SDL_Surface* s = active_surface();
+    if (!s) return;
+    short w = (short)(x2 - x1 + 1), h = (short)(y2 - y1 + 1);
+    short* hdr = (short*)image;
+    hdr[0] = w; hdr[1] = h;
+    Uint32* bits = (Uint32*)((short*)image + 2);
+    for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++)
+            bits[yy * w + xx] = raw_getpixel(s, x1 + xx, y1 + yy);
+}
+void putimage(int x, int y, void* image, int) {
+    SDL_Surface* s = active_surface();
+    if (!s) return;
+    short* hdr = (short*)image;
+    short w = hdr[0], h = hdr[1];
+    Uint32* bits = (Uint32*)((short*)image + 2);
+    for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++)
+            raw_putpixel(s, x + xx, y + yy, bits[yy * w + xx]);
+}
+
+unsigned int getpixel(int x, int y) {
+    SDL_Surface* s = active_surface();
+    if (!s) return (unsigned int)-1;
+    Uint32 pix = raw_getpixel(s, x, y);
+    Uint8 r, g, b, a;
+    SDL_GetRGBA(pix, s->format, &r, &g, &b, &a);
+    for (int c = 0; c <= MAXCOLORS; c++) {
+        RGB rgb = g_palette_rgb[c];
+        if (rgb.r == r && rgb.g == g && rgb.b == b) return c;
+    }
+    return (unsigned int)-1;
+}
+void putpixel(int x, int y, int c) {
+    raw_putpixel(active_surface(), x, y, map_color(active_surface(), c));
+}
+
+void closegraph() {
+    for (auto& kv : g_font_cache) if (kv.second) TTF_CloseFont(kv.second);
+    g_font_cache.clear();
+    for (auto& p : g_pages) { if (p) { SDL_FreeSurface(p); p = nullptr; } }
+    if (g_texture) { SDL_DestroyTexture(g_texture); g_texture = nullptr; }
+    if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = nullptr; }
+    if (g_window) { SDL_DestroyWindow(g_window); g_window = nullptr; }
+    TTF_Quit();
+    SDL_Quit();
+}
+
+void initgraph(int* device, int* mode, char const* /*pathtodriver*/, int size_width, int size_height) {
+    g_gdi_error_code = grOk;
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { g_gdi_error_code = grNotDetected; return; }
+    if (TTF_Init() != 0) { g_gdi_error_code = grFontNotFound; }
+
+    for (int i = 0; i < 64; i++) g_palette_map[i] = i;
+    g_current_palette.size = MAXCOLORS + 1;
+    for (int i = 0; i <= MAXCOLORS; i++) g_current_palette.colors[i] = i;
+
+    g_window_width = size_width > 0 ? size_width : 640;
+    g_window_height = size_height > 0 ? size_height : 480;
+
+    g_window = SDL_CreateWindow("BGI (SDL2)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                 g_window_width, g_window_height, SDL_WINDOW_SHOWN);
+    if (!g_window) { g_gdi_error_code = grNoInitGraph; return; }
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+    if (!g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
+    SDL_StartTextInput();
+
+    graphdefaults();
+    g_active_page = g_visual_page = 0;
+    g_view_settings = {0, 0, g_window_width - 1, g_window_height - 1, CLIP_OFF};
+
+    ensure_page(0);
+    present_page();
+
+    if (device) *device = VGA;
+    if (mode) *mode = VGAMAX;
+}
+
+#endif // _WIN32

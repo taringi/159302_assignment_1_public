@@ -22,7 +22,7 @@
     #include <algorithm> //used by transform - to lower case
     #include <exception>
     #include <chrono>
-    #include <graphics.h>
+    #include "graphics.h"
 
     #include "algorithm.h"
 
@@ -616,7 +616,7 @@ int main( int argc, char* argv[] ){
 #if defined __unix__ || defined __APPLE__
     // init graphics
     int GraphDriver=DETECT,GraphMode;
-    initgraph( &GraphDriver, &GraphMode, "" ); // Start Window
+    initgraph( &GraphDriver, &GraphMode, "", WIDTH, HEIGHT ); // Start Window
 
 #elif defined __WIN32__    
     // init graphics
